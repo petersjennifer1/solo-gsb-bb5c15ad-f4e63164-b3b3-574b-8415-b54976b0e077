@@ -445,6 +445,59 @@ BEFORE DELETE ON barcode_reassignment_items
 BEGIN
     SELECT RAISE(ABORT, 'barcode_reassignment_items 不可变:禁止删除条码换绑明细');
 END;
+
+-- 样品冷链测温配置:每个样品至多一条,登记固定的允许温度上下限与最大采样间隔(秒);
+-- payload 规范化入库用于比对重放;配置固定不可改(触发器禁止 UPDATE/DELETE)
+CREATE TABLE IF NOT EXISTS sample_temp_profiles (
+    sample_id            TEXT PRIMARY KEY,
+    min_temp             REAL NOT NULL,
+    max_temp             REAL NOT NULL,
+    max_interval_seconds INTEGER NOT NULL CHECK (max_interval_seconds > 0),
+    payload              TEXT NOT NULL,
+    created_at           TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    CHECK (min_temp < max_temp),
+    FOREIGN KEY (sample_id) REFERENCES samples(sample_id)
+);
+
+-- 测温读数:按样品写入带时区的测温时间与值,入库前归一化为 UTC(固定 6 位微秒、Z 结尾,
+-- 字符串排序即时间排序);(sample_id, measured_at_utc) 唯一,是幂等键:
+-- 同样品同 UTC 时刻同值重放不新增,异值冲突;读数不可变(触发器禁止 UPDATE/DELETE)
+CREATE TABLE IF NOT EXISTS temperature_readings (
+    reading_id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    sample_id       TEXT NOT NULL,
+    measured_at_utc TEXT NOT NULL,
+    temperature     REAL NOT NULL,
+    created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    FOREIGN KEY (sample_id) REFERENCES samples(sample_id),
+    UNIQUE (sample_id, measured_at_utc)
+);
+
+CREATE INDEX IF NOT EXISTS idx_treadings_sample_time
+    ON temperature_readings(sample_id, measured_at_utc);
+
+CREATE TRIGGER IF NOT EXISTS trg_temp_profile_no_update
+BEFORE UPDATE ON sample_temp_profiles
+BEGIN
+    SELECT RAISE(ABORT, 'sample_temp_profiles 不可变:测温配置固定,禁止更新');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_temp_profile_no_delete
+BEFORE DELETE ON sample_temp_profiles
+BEGIN
+    SELECT RAISE(ABORT, 'sample_temp_profiles 不可变:测温配置固定,禁止删除');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_treading_no_update
+BEFORE UPDATE ON temperature_readings
+BEGIN
+    SELECT RAISE(ABORT, 'temperature_readings 不可变:禁止更新测温读数');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_treading_no_delete
+BEFORE DELETE ON temperature_readings
+BEGIN
+    SELECT RAISE(ABORT, 'temperature_readings 不可变:禁止删除测温读数');
+END;
 """
 
 

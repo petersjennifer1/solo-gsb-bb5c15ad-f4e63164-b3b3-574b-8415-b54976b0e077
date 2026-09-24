@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typing import Annotated, Literal, Optional, Union
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import AwareDatetime, BaseModel, Field, model_validator
 
 Amount = Annotated[float, Field(gt=0, description="必须为正数的质量/体积")]
 
@@ -693,4 +693,83 @@ class BarcodeLookupResponse(BaseModel):
     )
     reassignment_no: Optional[str] = Field(
         default=None, description="当前绑定由哪个换绑批次写入(审计溯源)"
+    )
+
+
+# ---------------------------------------------------------------- 样品冷链测温
+
+class TempProfileRequest(BaseModel):
+    """为已有样品登记冷链测温配置:固定的允许温度上下限与最大采样间隔。
+
+    配置按样品唯一、登记后固定不可改;同样品同内容重放返回首次结果,
+    同样品不同内容返回 `409 temp_profile_conflict`。
+    """
+
+    sample_id: str = Field(min_length=1, description="样品编号(样品必须已存在)")
+    min_temp: float = Field(description="允许温度下限,读数严格低于此值判为低温越界")
+    max_temp: float = Field(description="允许温度上限,读数严格高于此值判为高温越界")
+    max_interval_seconds: int = Field(
+        gt=0, description="最大采样间隔(秒);相邻同向越界读数间隔不超过该值才归为同一区间"
+    )
+
+    @model_validator(mode="after")
+    def _check_bounds(self) -> "TempProfileRequest":
+        if self.min_temp >= self.max_temp:
+            raise ValueError("min_temp 必须严格小于 max_temp")
+        return self
+
+
+class TempProfileResult(BaseModel):
+    sample_id: str
+    min_temp: float = Field(description="允许温度下限(固定)")
+    max_temp: float = Field(description="允许温度上限(固定)")
+    max_interval_seconds: int = Field(description="最大采样间隔(秒,固定)")
+    replayed: bool = Field(
+        default=False, description="True 表示命中样品幂等,返回首次登记结果"
+    )
+    created_at: Optional[str] = None
+
+
+class TemperatureReadingIn(BaseModel):
+    """测温记录:带时区的测温时间与温度值。
+
+    `measured_at` 必须携带时区信息(如 `2026-09-24T10:00:00+08:00`),
+    服务端归一化为 UTC 后作为幂等键的一部分;不带时区返回 422。
+    """
+
+    measured_at: AwareDatetime = Field(description="测温时间(必须带时区,服务端归一化为 UTC)")
+    temperature: float
+
+
+class TemperatureReadingResult(BaseModel):
+    sample_id: str
+    measured_at: str = Field(description="归一化后的 UTC 测温时间(ISO 8601, Z 结尾)")
+    temperature: float
+    replayed: bool = Field(
+        default=False,
+        description="True 表示同样品同 UTC 时刻同值重放,未新增记录",
+    )
+    created_at: Optional[str] = None
+
+
+class ExcursionInterval(BaseModel):
+    direction: Literal["below", "above"] = Field(
+        description="越界方向:below=低于下限,above=高于上限"
+    )
+    start_at: str = Field(description="区间起始读数的 UTC 时间")
+    end_at: str = Field(description="区间结束读数的 UTC 时间")
+    extreme_value: float = Field(
+        description="区间极值:below 取最低温度,above 取最高温度"
+    )
+    extreme_at: str = Field(description="极值出现的 UTC 时间")
+    reading_count: int = Field(description="归并到本区间的越界读数条数")
+
+
+class ExcursionResponse(BaseModel):
+    sample_id: str
+    min_temp: float = Field(description="样品固定允许温度下限")
+    max_temp: float = Field(description="样品固定允许温度上限")
+    max_interval_seconds: int = Field(description="样品固定最大采样间隔(秒)")
+    intervals: list[ExcursionInterval] = Field(
+        description="越界区间,按起止时间升序;依据当前全部读数实时重算"
     )
