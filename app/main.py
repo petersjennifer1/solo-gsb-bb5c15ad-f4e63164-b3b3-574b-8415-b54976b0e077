@@ -16,6 +16,7 @@ from . import reservations as rsv
 from . import reversals as rev
 from . import service
 from . import stocktakes as st
+from . import temperatures as tp
 from . import transfers as tr
 from .config import BALANCE_TOLERANCE, DB_PATH
 from .db import connect, get_conn, init_db
@@ -65,9 +66,13 @@ app = FastAPI(
         "- 样品条码整批换绑:接收批次号与多项样品号/预期旧条码/目标条码(null=未绑定),\n"
         "  单事务核对样品存在、旧绑定与预期一致且目标条码未被批外样品占用,\n"
         "  先解除本批旧绑定再写入新绑定,支持两样品互换与多样品循环,\n"
-        "  任一冲突整批不变并返回逐项原因,按批次号幂等重放,写不可变换绑审计"
+        "  任一冲突整批不变并返回逐项原因,按批次号幂等重放,写不可变换绑审计\n"
+        "- 样品冷链测温:为已有样品登记固定的允许温度上下限与最大采样间隔,\n"
+        "  按样品写入带时区测温时间与值(归一化 UTC 时刻为幂等键:同值重放不新增、异值冲突),\n"
+        "  允许乱序补录;越界区间查询依据当前全部读数重新计算,补录可合并或拆分既有区间,\n"
+        "  相邻同方向越界读数仅在间隔不超过配置值时归为同一区间,返回起止时间、方向与极值"
     ),
-    version="1.5.0",
+    version="1.6.0",
     lifespan=lifespan,
 )
 
@@ -163,6 +168,21 @@ async def barcode_error_handler(
 ) -> JSONResponse:
     code = exc.conflicts[0].code if exc.conflicts else "barcode_error"
     status_code = 404 if code in {"reassignment_not_found"} else 409
+    return JSONResponse(
+        status_code=status_code,
+        content={
+            "error": code if status_code == 404 else "conflict",
+            "conflicts": [c.model_dump() for c in exc.conflicts],
+        },
+    )
+
+
+@app.exception_handler(tp.TemperatureError)
+async def temperature_error_handler(
+    _request, exc: tp.TemperatureError
+) -> JSONResponse:
+    code = exc.conflicts[0].code if exc.conflicts else "temperature_error"
+    status_code = 404 if code == "temperature_profile_not_found" else 409
     return JSONResponse(
         status_code=status_code,
         content={
@@ -693,3 +713,104 @@ def lookup_barcode(
     conn: sqlite3.Connection = Depends(get_conn),
 ) -> s.BarcodeLookupResponse:
     return bc.lookup_barcode(conn, barcode)
+
+
+# ------------------------------------------------------------ 样品冷链测温
+
+@app.put(
+    "/api/v1/samples/{sample_id}/temperature-profile",
+    response_model=s.TemperatureProfileResult,
+    tags=["冷链测温"],
+    summary="为已有样品登记固定的允许温度上下限与最大采样间隔(登记后不可改,同内容重放)",
+)
+def register_temperature_profile(
+    sample_id: str,
+    body: s.TemperatureProfileRequest,
+    conn: sqlite3.Connection = Depends(get_conn),
+) -> s.TemperatureProfileResult:
+    return tp.register_profile(conn, sample_id, body)
+
+
+@app.get(
+    "/api/v1/samples/{sample_id}/temperature-profile",
+    response_model=s.TemperatureProfileResult,
+    tags=["冷链测温"],
+    summary="查询样品冷链测温配置(未登记返回 404)",
+)
+def get_temperature_profile(
+    sample_id: str,
+    conn: sqlite3.Connection = Depends(get_conn),
+) -> s.TemperatureProfileResult:
+    if conn.execute(
+        "SELECT 1 FROM samples WHERE sample_id = ?", (sample_id,)
+    ).fetchone() is None:
+        return JSONResponse(
+            status_code=404,
+            content={
+                "error": "not_found",
+                "message": f"样品 {sample_id} 不存在",
+            },
+        )
+    return tp.get_profile(conn, sample_id)
+
+
+@app.post(
+    "/api/v1/samples/{sample_id}/temperature-readings",
+    response_model=s.TemperatureReadingResult,
+    tags=["冷链测温"],
+    summary="按样品写入带时区测温时间与值:同一样品与归一化 UTC 时刻同值重放不新增、异值冲突(允许乱序补录)",
+)
+def add_temperature_reading(
+    sample_id: str,
+    body: s.TemperatureReadingIn,
+    conn: sqlite3.Connection = Depends(get_conn),
+) -> s.TemperatureReadingResult:
+    return tp.add_reading(conn, sample_id, body)
+
+
+@app.get(
+    "/api/v1/samples/{sample_id}/temperature-readings",
+    response_model=s.TemperatureReadingListResponse,
+    tags=["冷链测温"],
+    summary="按样品列出当前全部测温读数(默认测温时间升序,?order=desc 倒序)",
+)
+def list_temperature_readings(
+    sample_id: str,
+    order: str = Query("asc", pattern="^(asc|desc)$"),
+    conn: sqlite3.Connection = Depends(get_conn),
+) -> s.TemperatureReadingListResponse:
+    if conn.execute(
+        "SELECT 1 FROM samples WHERE sample_id = ?", (sample_id,)
+    ).fetchone() is None:
+        return JSONResponse(
+            status_code=404,
+            content={
+                "error": "not_found",
+                "message": f"样品 {sample_id} 不存在",
+            },
+        )
+    return tp.list_readings(conn, sample_id, order)
+
+
+@app.get(
+    "/api/v1/samples/{sample_id}/temperature-excursions",
+    response_model=s.TemperatureExcursionResponse,
+    tags=["冷链测温"],
+    summary="越界区间查询:依据当前全部读数重新计算(乱序补录可合并或拆分既有区间),"
+            "相邻同方向越界读数仅在间隔不超过最大采样间隔时归为同一区间",
+)
+def get_temperature_excursions(
+    sample_id: str,
+    conn: sqlite3.Connection = Depends(get_conn),
+) -> s.TemperatureExcursionResponse:
+    if conn.execute(
+        "SELECT 1 FROM samples WHERE sample_id = ?", (sample_id,)
+    ).fetchone() is None:
+        return JSONResponse(
+            status_code=404,
+            content={
+                "error": "not_found",
+                "message": f"样品 {sample_id} 不存在",
+            },
+        )
+    return tp.compute_excursions(conn, sample_id)

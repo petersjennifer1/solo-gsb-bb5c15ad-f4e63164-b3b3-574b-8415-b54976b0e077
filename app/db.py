@@ -445,6 +445,63 @@ BEFORE DELETE ON barcode_reassignment_items
 BEGIN
     SELECT RAISE(ABORT, 'barcode_reassignment_items 不可变:禁止删除条码换绑明细');
 END;
+
+-- 冷链测温配置:为已有样品登记固定的允许温度上下限(min_temp/max_temp)
+-- 与最大采样间隔(max_interval_seconds,秒);一个样品至多一条,登记后不可改(触发器)
+CREATE TABLE IF NOT EXISTS temperature_profiles (
+    sample_id            TEXT PRIMARY KEY,
+    min_temp             REAL NOT NULL,
+    max_temp             REAL NOT NULL,
+    max_interval_seconds REAL NOT NULL CHECK (max_interval_seconds > 0),
+    note                 TEXT,
+    created_at           TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    FOREIGN KEY (sample_id) REFERENCES samples(sample_id),
+    CHECK (max_temp > min_temp)
+);
+
+-- 冷链测温读数:measured_at_utc 为归一化到 UTC 的测温时刻(微秒精度 ISO8601,幂等键),
+-- measured_at_raw 保留客户端提交的带时区原始表示,measured_at_epoch 为 UTC 秒数(排序/间隔);
+-- 同样品同一归一化 UTC 时刻只允许一条(UNIQUE 兜底:同值重放不新增,异值冲突);
+-- 读数只追加、不可变(触发器禁止 UPDATE/DELETE),允许乱序补录,越界区间查询时按当前全量重算
+CREATE TABLE IF NOT EXISTS temperature_readings (
+    reading_id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    sample_id         TEXT NOT NULL,
+    measured_at_utc   TEXT NOT NULL,
+    measured_at_raw   TEXT NOT NULL,
+    measured_at_epoch REAL NOT NULL,
+    value             REAL NOT NULL,
+    note              TEXT,
+    created_at        TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    FOREIGN KEY (sample_id) REFERENCES samples(sample_id),
+    UNIQUE (sample_id, measured_at_utc)
+);
+
+CREATE INDEX IF NOT EXISTS idx_temps_sample_time
+    ON temperature_readings(sample_id, measured_at_epoch);
+
+CREATE TRIGGER IF NOT EXISTS trg_tprofile_no_update
+BEFORE UPDATE ON temperature_profiles
+BEGIN
+    SELECT RAISE(ABORT, 'temperature_profiles 不可变:温度上下限与最大采样间隔登记后固定');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_tprofile_no_delete
+BEFORE DELETE ON temperature_profiles
+BEGIN
+    SELECT RAISE(ABORT, 'temperature_profiles 不可变:禁止删除测温配置');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_treading_no_update
+BEFORE UPDATE ON temperature_readings
+BEGIN
+    SELECT RAISE(ABORT, 'temperature_readings 不可变:禁止修改测温读数');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_treading_no_delete
+BEFORE DELETE ON temperature_readings
+BEGIN
+    SELECT RAISE(ABORT, 'temperature_readings 不可变:禁止删除测温读数');
+END;
 """
 
 
